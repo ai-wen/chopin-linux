@@ -1,0 +1,261 @@
+# =============================================================================
+# chopin-linux 构建流水线（手动触发）
+#
+# 按项目 README 的本地流程在 CI 复现：
+#   make bootstrap → make kernel → sudo make debian → make artifacts
+# 产物（Actions artifact）：
+#   boot-chopin-debian.img     刷 boot 分区
+#   chopin-rootfs.sparse.img   刷 userdata 分区（Android sparse，32 位 fastboot）
+#   Image / Image.gz / dtb / initramfs.cpio.gz / SHA256SUMS
+#
+# 缓存策略（input: reuse_cache，默认勾选=复用；取消=全量重建）：
+#   1. kernel 缓存   kernel/linux（含树内构建状态）+ kernel/out
+#                    key = kbuild-<CHOPIN_TREE>（base.env 锚点，补丁一变即失效）
+#   2. debian 缓存   debian/build + debian/third_party，以 tar 文件缓存
+#                    （rootfs 内有 root 属主 0600 文件，runner 无法直接读，
+#                      故 sudo tar 打包/解包，保留属主与权限）
+#                    key = debianfs-<debian 子模块 SHA>
+#                    （03-install-kernel 每次重跑，内核更新不使此缓存失效；
+#                      00-mkrootfs 幂等护栏命中即跳过；04-mesa 的 ninja
+#                      构建目录在缓存内，命中时增量秒级）
+#   注意 actions/cache 条目不可变：同 key 重建时保存失败会被忽略（预期），
+#   想强制刷新缓存请到 Actions 缓存页删除对应条目。
+#
+# 原厂 boot 模板（07-mkbootimg 需要）：stock/boot_a.zip（用户提交，
+# 原厂 boot_a.img 128MB 超 GitHub 单文件 100MB 限制，压缩为 zip 提交），
+# CI 内解压后经 versions.env 的 STOCK_BOOT 指向。
+# =============================================================================
+
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      reuse_cache:
+        description: '复用产物缓存（内核构建 / Debian rootfs）；取消勾选则全量重建'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build chopin-linux (kernel + Debian + flashable images)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      # ---------------------------------------------------------------------
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---------------------------------------------------------------------
+      # 版本锚点（缓存 key 来源）
+      # ---------------------------------------------------------------------
+      - name: Read version anchors
+        id: anchors
+        run: |
+          set -euo pipefail
+          . kernel/base.env
+          echo "chopin_tree=$CHOPIN_TREE"   >> "$GITHUB_OUTPUT"
+          echo "patch_count=$PATCH_COUNT"   >> "$GITHUB_OUTPUT"
+          echo "base_version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+          debian_sha="$(git -C debian rev-parse HEAD)"
+          echo "debian_sha=$debian_sha" >> "$GITHUB_OUTPUT"
+          echo "kernel tree: $CHOPIN_TREE ($PATCH_COUNT patches on $BASE_VERSION)"
+          echo "debian sha : $debian_sha"
+
+      # ---------------------------------------------------------------------
+      # 依赖（清单来自 scripts/check-env.sh + debian 各脚本要求）
+      # ---------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            flex bison bc libssl-dev libelf-dev libncurses-dev \
+            cpio kmod rsync device-tree-compiler unzip \
+            python3 python3-venv xz-utils zstd lz4 dwarves curl patch \
+            mmdebstrap debootstrap e2fsprogs \
+            meson ninja-build \
+            g++-14-aarch64-linux-gnu libstdc++-14-dev-arm64-cross \
+            qemu-user-static
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 内核缓存：kernel/linux（含树内构建状态）+ kernel/out（模块安装产物）
+      # 全部 runner 属主，可直接交给 actions/cache
+      # ---------------------------------------------------------------------
+      - name: Restore kernel cache
+        id: kcache
+        if: inputs.reuse_cache == true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            kernel/linux
+            kernel/out
+          key: kbuild-${{ steps.anchors.outputs.chopin_tree }}
+
+      # ---------------------------------------------------------------------
+      # make bootstrap：tarball 下载校验 + 37 补丁 + tree 锚点校验
+      # 脚本自带幂等护栏：缓存树命中锚点时秒过
+      # ---------------------------------------------------------------------
+      - name: Bootstrap kernel source
+        run: |
+          set -euo pipefail
+          make bootstrap
+          git -C kernel/linux log --oneline -1
+
+      # ---------------------------------------------------------------------
+      # make kernel：Image.gz + dtbs + modules（树内构建，GCC 交叉）
+      # ---------------------------------------------------------------------
+      - name: Build kernel
+        if: inputs.reuse_cache != true || steps.kcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          make kernel
+          df -h /
+
+      - name: Verify cached kernel artifacts
+        if: inputs.reuse_cache == true && steps.kcache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          test -f kernel/linux/arch/arm64/boot/Image.gz \
+            || { echo "缓存缺 Image.gz；请取消勾选 reuse_cache 重跑" >&2; exit 1; }
+          test -d kernel/out/modules \
+            || { echo "缓存缺模块产物；请取消勾选 reuse_cache 重跑" >&2; exit 1; }
+          echo "reusing cached kernel: $(cat kernel/linux/include/config/kernel.release)"
+
+      - name: Save kernel cache
+        if: inputs.reuse_cache != true || steps.kcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            kernel/linux
+            kernel/out
+          key: kbuild-${{ steps.anchors.outputs.chopin_tree }}
+        # 同 key 已存在时 save 报错（缓存不可变），吞掉；刷新请删缓存条目
+        continue-on-error: true
+
+      # ---------------------------------------------------------------------
+      # Debian rootfs 缓存：以 tar 文件形式缓存（root 属主文件需 sudo 打包）
+      # ---------------------------------------------------------------------
+      - name: Restore Debian rootfs cache (tar)
+        id: dcache
+        if: inputs.reuse_cache == true
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci/debianfs-cache.tar
+          key: debianfs-${{ steps.anchors.outputs.debian_sha }}
+
+      - name: Extract Debian rootfs cache
+        if: inputs.reuse_cache == true && steps.dcache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          sudo tar -xf .ci/debianfs-cache.tar
+          test -d debian/build/rootfs \
+            || { echo "缓存 tar 异常（无 rootfs）；请删缓存条目重跑" >&2; exit 1; }
+          echo "rootfs cache restored: $(sudo cat debian/build/rootfs/etc/debian_version 2>/dev/null || echo '?')"
+
+      # ---------------------------------------------------------------------
+      # 原厂 boot 模板：解压 stock/boot_a.zip（128MB 原图超 GitHub 单文件
+      # 限制，以 zip 提交）；已有 stock/boot_a.img 时直接使用（本地语义）
+      # ---------------------------------------------------------------------
+      - name: Prepare stock boot image
+        run: |
+          set -euo pipefail
+          if [ ! -f stock/boot_a.img ]; then
+            test -f stock/boot_a.zip \
+              || { echo "缺少 stock/boot_a.zip（原厂 boot 模板）" >&2; exit 1; }
+            unzip -o -d stock/ stock/boot_a.zip
+          fi
+          head -c8 stock/boot_a.img | grep -q 'ANDROID!' \
+            || { echo "stock/boot_a.img 不是 Android boot 镜像" >&2; exit 1; }
+          ls -lh stock/boot_a.img
+          sed -i "s|^STOCK_BOOT=.*|STOCK_BOOT=$GITHUB_WORKSPACE/stock/boot_a.img|" \
+            debian/config/versions.env
+          grep '^STOCK_BOOT=' debian/config/versions.env
+
+      # ---------------------------------------------------------------------
+      # sudo make debian：00-07 全链
+      #   缓存命中时：00 跳过（护栏）、01-02 幂等、03 重装内核产物、
+      #   04 mesa ninja 增量、05-07 重新生成镜像
+      # ---------------------------------------------------------------------
+      - name: Build Debian rootfs and images
+        run: |
+          set -euo pipefail
+          sudo make debian
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 磁盘预算：删 raw 镜像（刷机/缓存只用 sparse；collect 容忍缺失）
+      # 放在缓存打包前，压低磁盘峰值
+      # ---------------------------------------------------------------------
+      - name: Prune raw rootfs image (disk budget)
+        run: |
+          set -euo pipefail
+          rm -f debian/out/chopin-rootfs.img
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 打包 Debian 缓存（sudo tar 保属主/权限），再交 actions/cache 存文件
+      # ---------------------------------------------------------------------
+      - name: Pack Debian rootfs cache (tar)
+        if: inputs.reuse_cache == true && steps.dcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .ci
+          sudo tar -cf .ci/debianfs-cache.tar debian/build debian/third_party
+          sudo chown "$(id -u):$(id -g)" .ci/debianfs-cache.tar
+          ls -lh .ci/debianfs-cache.tar
+
+      - name: Save Debian rootfs cache
+        if: inputs.reuse_cache == true && steps.dcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci/debianfs-cache.tar
+          key: debianfs-${{ steps.anchors.outputs.debian_sha }}
+        continue-on-error: true
+
+      # ---------------------------------------------------------------------
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          make artifacts
+
+      # ---------------------------------------------------------------------
+      - name: Job summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## chopin-linux 构建产物"
+            echo
+            echo "- 内核：\`$(cat kernel/linux/include/config/kernel.release)\`（tree \`${{ steps.anchors.outputs.chopin_tree }}\`，${{ steps.anchors.outputs.patch_count }} 补丁）"
+            echo "- Debian：\`${{ steps.anchors.outputs.base_version }}\` + GNOME（debian \`${{ steps.anchors.outputs.debian_sha }}\`）"
+            echo "- 内核缓存：${{ steps.kcache.outputs.cache-hit == 'true' && '命中（跳过编译）' || '未命中（全量编译）' }}"
+            echo "- rootfs 缓存：${{ steps.dcache.outputs.cache-hit == 'true' && '命中（跳过 mmdebstrap/GNOME 安装）' || '未命中（全量构建）' }}"
+            echo
+            echo "### 刷机"
+            echo '```bash'
+            echo "fastboot flash boot     boot-chopin-debian.img"
+            echo "fastboot flash userdata chopin-rootfs.sparse.img   # 覆盖 userdata，安卓数据不可恢复"
+            echo "fastboot reboot"
+            echo '```'
+            echo
+            echo "- 登录：\`chopin / chopin\`（versions.env）；USB NCM 网口 \`192.168.42.2\` 可 SSH"
+            echo "- 详细步骤与回滚：docs/flashing.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopin-linux-build
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7

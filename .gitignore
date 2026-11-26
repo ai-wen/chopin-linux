@@ -1,7 +1,6 @@
 
 # 构建产物
 /out/
-/stock/*
 !/stock/README.md
 __pycache__/
 *.pyc
