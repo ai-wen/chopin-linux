@@ -243,11 +243,11 @@ jobs:
       # 磁盘预算：删 raw 镜像（刷机/缓存只用 sparse；collect 容忍缺失）
       # debian/out 产物为 root 属主（sudo make debian 生成），需 sudo 删除
       # ---------------------------------------------------------------------
-      - name: Prune raw rootfs image (disk budget)
-        run: |
-          set -euo pipefail
-          sudo rm -f debian/out/chopin-rootfs.img
-          df -h /
+      #- name: Prune raw rootfs image (disk budget)
+      #  run: |
+      #    set -euo pipefail
+      #    sudo rm -f debian/out/chopin-rootfs.img
+      #    df -h /
 
       # ---------------------------------------------------------------------
       - name: Collect artifacts
