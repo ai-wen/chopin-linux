@@ -182,6 +182,22 @@ jobs:
           grep '^STOCK_BOOT=' debian/config/versions.env
 
       # ---------------------------------------------------------------------
+      # 路径桥接：debian 侧 lib.sh 消费顶层 linux/ 与 out/modules，
+      # 而 kernel 侧脚本产出 kernel/linux 与 kernel/out —— 用符号链接对齐
+      # （out 本体保持真实目录：collect-artifacts 会往里写文件，不能链到
+      #   kernel/out，否则出现源=目的的自拷贝冲突）
+      # ---------------------------------------------------------------------
+      - name: Bridge kernel paths for debian scripts
+        run: |
+          set -euo pipefail
+          ln -sfn kernel/linux linux
+          mkdir -p out
+          ln -sfn ../kernel/out/modules out/modules
+          ls -ld linux out out/modules
+          test -f linux/arch/arm64/boot/Image.gz
+          test -d out/modules/lib/modules
+
+      # ---------------------------------------------------------------------
       # sudo make debian：00-07 全链
       #   缓存命中时：00 跳过（护栏）、01-02 幂等、03 重装内核产物、
       #   04 mesa ninja 增量、05-07 重新生成镜像
