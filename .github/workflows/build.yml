@@ -81,7 +81,7 @@ jobs:
             flex bison bc libssl-dev libelf-dev libncurses-dev \
             cpio kmod rsync device-tree-compiler unzip \
             python3 python3-venv xz-utils zstd lz4 dwarves curl patch \
-            mmdebstrap debootstrap e2fsprogs \
+            mmdebstrap debootstrap arch-test e2fsprogs \
             meson ninja-build \
             g++-14-aarch64-linux-gnu libstdc++-14-dev-arm64-cross \
             qemu-user-static
@@ -189,6 +189,11 @@ jobs:
       - name: Build Debian rootfs and images
         run: |
           set -euo pipefail
+          # 预防性加固：01-install-desktop 会把主机 resolv.conf 拷进 chroot，
+          # 而它指向 systemd-resolved 桩(127.0.0.53)，qemu chroot 内可能失效
+          # （Arch 侧同类项目实测踩坑）→ 换成公共 DNS 再开始构建
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf >/dev/null
           sudo make debian
           df -h /
 
