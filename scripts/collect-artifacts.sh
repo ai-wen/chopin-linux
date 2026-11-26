@@ -25,11 +25,4 @@ copy "$TOP/debian/out/boot-chopin-debian.img"
 copy "$TOP/debian/out/chopin-rootfs.img"
 copy "$TOP/debian/out/chopin-rootfs.sparse.img"
 
-if find "$OUT" -maxdepth 1 -type f ! -name SHA256SUMS | grep -q .; then
-    rm -f "$OUT/SHA256SUMS"
-    ( cd "$OUT" && sha256sum ./* > SHA256SUMS )
-    echo "== SHA256SUMS =="
-    cat "$OUT/SHA256SUMS"
-else
-    echo "没有可汇总的产物。先构建内核 / Debian。"
-fi
+( cd "$OUT" && sha256sum $(find . -maxdepth 1 -type f ! -name SHA256SUMS) > SHA256SUMS )
