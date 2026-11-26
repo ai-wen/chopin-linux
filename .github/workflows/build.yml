@@ -182,10 +182,13 @@ jobs:
           grep '^STOCK_BOOT=' debian/config/versions.env
 
       # ---------------------------------------------------------------------
-      # 路径桥接：debian 侧 lib.sh 消费顶层 linux/ 与 out/modules，
-      # 而 kernel 侧脚本产出 kernel/linux 与 kernel/out —— 用符号链接对齐
-      # （out 本体保持真实目录：collect-artifacts 会往里写文件，不能链到
-      #   kernel/out，否则出现源=目的的自拷贝冲突）
+      # 路径桥接：debian 侧脚本按顶层路径消费 kernel 侧产物 —— 符号链接对齐
+      #   linux        → kernel/linux        （lib.sh 的 KERNEL_DIR：03/07）
+      #   out/modules  → kernel/out/modules  （03 的模块源）
+      #   scripts/mkbootimg.py → kernel/scripts/mkbootimg.py（07 调用）
+      # （out 本体保持真实目录：collect-artifacts 会往里写文件，不能整体
+      #   链到 kernel/out，否则源=目的自拷贝；链接均为 workspace 临时产物，
+      #   CI 每次重建，本地也不要提交它们）
       # ---------------------------------------------------------------------
       - name: Bridge kernel paths for debian scripts
         run: |
@@ -193,9 +196,11 @@ jobs:
           ln -sfn kernel/linux linux
           mkdir -p out
           ln -sfn ../kernel/out/modules out/modules
-          ls -ld linux out out/modules
+          ln -sfn ../kernel/scripts/mkbootimg.py scripts/mkbootimg.py
+          ls -ld linux out out/modules scripts/mkbootimg.py
           test -f linux/arch/arm64/boot/Image.gz
           test -d out/modules/lib/modules
+          test -f scripts/mkbootimg.py
 
       # ---------------------------------------------------------------------
       # sudo make debian：00-07 全链
